@@ -7,16 +7,16 @@ Uma ferramenta Python simples e eficiente para baixar repositórios públicos do
 
 ## 🚀 Funcionalidades
 
-- **Clone sem Git**: Baixa todo o conteúdo sem precisar do protocolo git.
-- **Modo Scraping Inteligente**: Simula a navegação de um usuário ("abrir e copiar"), contornando bloqueios a downloads diretos ou à API raw.
-- **Estrutura Preservada**: Mantém a hierarquia exata de pastas e arquivos.
-- **Resiliência**: Tenta automaticamente branches alternativas e extrai código do HTML da página.
-- **Sem Dependências Pesadas**: Requer apenas `requests` e `beautifulsoup4`.
+- **Clone via Browser (Selenium)**: Usa uma automação real do Google Chrome.
+- **Proxy Friendly**: Usa as configurações de proxy do sistema/browser automaticamente. Permite login manual em janelas de autenticação.
+- **Scraping Visual**: Abre cada arquivo no navegador e copia o conteúdo.
+- **Sem Git**: Não requer git instalado, apenas o Chrome.
 
 ## 📦 Instalação
 
-1. Clone ou baixe este repositório.
-2. Instale as dependências:
+1. Tenha o **Google Chrome** instalado.
+2. Clone ou baixe este repositório.
+3. Instale as dependências:
 
 ```bash
 pip install -r requirements.txt

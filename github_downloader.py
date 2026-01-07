@@ -1,318 +1,242 @@
 #!/usr/bin/env python3
 """
-GitHub Repository Downloader
-Baixa todos os arquivos via Web/HTML Scraping (API-Free).
+GitHub Repository Downloader - Selenium Version
+Usa automação de navegador real para baixar repositórios, contornando proxies complexos.
 """
 
 import os
 import sys
-import requests
 import time
 import json
-import re
-import getpass
-from urllib.parse import urlparse, unquote
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from bs4 import BeautifulSoup
+from urllib.parse import unquote
+
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 
 class GitHubDownloader:
     def __init__(self, repo_url: str, output_dir: str = None, branch: str = "main"):
         self.repo_url = repo_url.rstrip('/')
         self.branch = branch
-        self.owner, self.repo = self._parse_repo_url()
-        self.output_dir = output_dir or self.repo
+        self.output_dir = output_dir or self.repo_url.split('/')[-1].replace('.git', '')
         self.web_base = "https://github.com"
-        self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-        })
-        self.stats = {'files': 0, 'dirs': 0, 'errors': 0, 'size': 0, 'skipped': 0}
-        self.visited_dirs = set()
         
-        # Check connection and setup proxy if needed
-        self._check_connection()
+        # stats
+        self.stats = {'files': 0, 'dirs': 0, 'errors': 0, 'skipped': 0}
+        self.visited_urls = set()
 
-    def _check_connection(self):
-        """Verifica conexão inicial e configura proxy autenticado se necessário."""
-        print("🔌 Verificando conexão e proxy...")
+    def _setup_driver(self):
+        print("� Iniciando Google Chrome...")
+        options = Options()
+        # options.add_argument("--headless") # Comentado para permitir interação visual (login proxy)
+        options.add_argument("--disable-gpu")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--log-level=3")
+        
+        service = Service(ChromeDriverManager().install())
+        self.driver = webdriver.Chrome(service=service, options=options)
+        self.driver.set_page_load_timeout(30)
+        print("   ✅ Browser iniciado. Se aparecer login de proxy, digite manualmente na janela.")
+
+    def _get_page_type(self, url: str):
+        """Determina se é blob (arquivo) ou tree (pasta) pela URL."""
+        if f"/blob/{self.branch}/" in url:
+            return 'blob'
+        if f"/tree/{self.branch}/" in url:
+            return 'tree'
+        return 'unknown'
+
+    def _wait_for_content(self, timeout=10):
         try:
-            # Tenta conectar ao GitHub (usa proxies do sistema/env vars por padrão)
-            self.session.get("https://github.com", timeout=10)
-            print("   ✅ Conexão inicial OK")
-        except requests.exceptions.ProxyError as e:
-            if "407" in str(e) or "authenticationrequired" in str(e).lower():
-                self._handle_proxy_auth()
-            else:
-                self._handle_proxy_auth(force_prompt=True, error_msg=str(e))
-        except requests.exceptions.SSLError:
-            print("   ⚠️  Erro de SSL detectado. Tentando ignorar verificação SSL (não recomendado)...")
-            self.session.verify = False
-            self.session.get("https://github.com", timeout=10)
-        except Exception as e:
-            if "407" in str(e): # Pega 407 genérico
-                self._handle_proxy_auth()
-            else:
-                print(f"   ⚠️  Aviso: Falha na conexão inicial: {e}")
-                print("       O script tentará continuar, mas pode falhar.")
+            # Espera carregar a lista de arquivos ou o blob do arquivo
+            WebDriverWait(self.driver, timeout).until(
+                lambda d: d.find_elements(By.CSS_SELECTOR, "div.react-directory-filename-column, table.files, div.blob-wrapper, table.highlight") 
+                          or d.find_elements(By.CSS_SELECTOR, "script[type='application/json']")
+            )
+            time.sleep(1) # Extra buffer for heavy JS
+        except:
+            pass
 
-    def _handle_proxy_auth(self, force_prompt=False, error_msg=""):
-        print(f"\n🚫 FALHA DE AUTENTICAÇÃO NO PROXY (407)")
-        if error_msg:
-             print(f"   Erro original: {error_msg}")
-        print("   Suas variáveis de ambiente definem um proxy, mas ele exige usuário e senha.")
-        print("   O Python 'requests' não pega credenciais do Windows automaticamente.\n")
+    def _extract_links_from_dir(self):
+        """Extrai links de arquivos e pastas da página atual."""
+        links = []
         
-        choice = input("👉 Deseja inserir usuário/senha do proxy agora? (S/n): ").strip().lower()
-        if choice in ['n', 'nao', 'não']:
-            return
-
-        proxy_host = input("🌐 Proxy Host (ex: proxy.empresa.com:8080) [Enter para tentar detectar]: ").strip()
-        user = input("👤 Usuário Proxy: ").strip()
-        password = getpass.getpass("🔑 Senha Proxy: ").strip()
-
-        if not proxy_host:
-            # Tenta pegar do environ se o usuário não digitar
-            proxy_host = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or ""
-            # Remove http:// e credenciais antigas se houver
-            proxy_host = proxy_host.replace("http://", "").replace("https://", "").split("@")[-1]
+        # Tenta pegar via elemento 'a' com classes específicas de navegação
+        # GitHub moderno (React) usa classes diferentes, então pegamos genérico e filtramos
+        elements = self.driver.find_elements(By.TAG_NAME, "a")
         
-        if not proxy_host:
-             print("❌ Erro: Nenhum host de proxy encontrado ou fornecido.")
-             return
-
-        # Monta URL autenticada
-        proxy_url = f"http://{user}:{password}@{proxy_host}"
+        repo_path_part = "/".join(self.repo_url.split('/')[-2:]) # user/repo
         
-        self.session.proxies = {
-            "http": proxy_url,
-            "https": proxy_url
-        }
-        
-        print("\n🔄 Retentando conexão com credenciais...")
-        try:
-            self.session.get("https://github.com", timeout=10)
-            print("   ✅ Autenticação de Proxy: SUCESSO!")
-        except Exception as e:
-             print(f"   ❌ Falha na autenticação do proxy: {e}")
-             sys.exit(1)
-
-    def _parse_repo_url(self) -> tuple:
-        parsed = urlparse(self.repo_url)
-        parts = parsed.path.strip('/').split('/')
-        if len(parts) < 2:
-            raise ValueError(f"URL inválida: {self.repo_url}")
-        return parts[0], parts[1].replace('.git', '')
-
-    def _get_page_content(self, url: str) -> BeautifulSoup:
-        """Baixa e parseia uma página HTML."""
-        try:
-            response = self.session.get(url, timeout=15)
-            if response.status_code == 404:
-                return None
-            response.raise_for_status()
-            return BeautifulSoup(response.text, 'html.parser')
-        except Exception as e:
-            print(f"❌ Erro ao acessar {url}: {e}")
-            return None
-
-    def _extract_items_from_payload(self, soup: BeautifulSoup, current_path: str = "") -> list:
-        """Tenta extrair itens de diretório do JSON interno (React) ou HTML fallback."""
-        items = [] # list of (type, name, path, url)
-        
-        # 1. Tentar via JSON embutido (mais confiável)
-        for script in soup.find_all('script', type='application/json'):
-            if 'tree' in script.text and 'items' in script.text:
-                try:
-                    data = json.loads(script.text)
-                    payload = data.get('payload', {})
-                    
-                    # Navegação na estrutura do payload
-                    if 'tree' in payload and 'items' in payload['tree']:
-                        for item in payload['tree']['items']:
-                            name = item['name']
-                            # Path completo
-                            full_path = item['path'] 
-                            # Determina tipo
-                            content_type = item['contentType'] # 'directory' ou 'file'
-                            
-                            item_type = 'tree' if content_type == 'directory' else 'blob'
-                            item_url = f"{self.web_base}/{self.owner}/{self.repo}/{item_type}/{self.branch}/{full_path}"
-                            
-                            items.append({
-                                'type': item_type,
-                                'path': full_path,
-                                'url': item_url
-                            })
-                        return items
-                except:
-                    pass
-
-        # 2. Fallback: Parsear HTML (tabela de arquivos)
-        # Seletores comuns do GitHub
-        links = soup.select('a.js-navigation-open')
-        for link in links:
-            href = link.get('href', '')
-            if not href: continue
-            
-            # Filtros básicos para ignorar links de navegação
-            if '/commit/' in href or '/commits/' in href or '/blame/' in href:
-                continue
-            if href.endswith('/..'):
-                continue
-                
-            # Verifica se é parte do repo
-            repo_base = f"/{self.owner}/{self.repo}"
-            if not href.startswith(repo_base):
-                continue
-                
-            # Identifica blob (arquivo) ou tree (pasta)
-            if f"/blob/{self.branch}/" in href:
-                item_type = 'blob'
-                rel_path = href.split(f"/blob/{self.branch}/", 1)[1]
-            elif f"/tree/{self.branch}/" in href:
-                item_type = 'tree'
-                rel_path = href.split(f"/tree/{self.branch}/", 1)[1]
-            else:
-                continue
-                
-            items.append({
-                'type': item_type,
-                'path': unquote(rel_path),
-                'url': self.web_base + href
-            })
-            
-        return items
-
-    def _scrape_file_content(self, url: str) -> str:
-        """Extrai conteúdo de arquivo do HTML (blob)."""
-        try:
-            soup = self._get_page_content(url)
-            if not soup: return None
-            
-            # 1. Tentar via JSON Payload (React)
-            for script in soup.find_all('script', type='application/json'):
-                if 'rawLines' in script.text:
-                    try:
-                        data = json.loads(script.text)
-                        if 'payload' in data and 'blob' in data['payload']:
-                            blob = data['payload']['blob']
-                            if 'rawLines' in blob:
-                                return '\n'.join(blob['rawLines'])
-                            if 'headerInfo' in blob and blob['headerInfo'].get('toc') is None:
-                                # Pode ser binário se não tiver rawLines
-                                pass
-                    except:
-                        pass
-            
-            # 2. Tentar via Tabela HTML (legado/fallback)
-            lines = []
-            rows = soup.find_all('td', class_='blob-code-inner')
-            if rows:
-                for row in rows:
-                    lines.append(row.get_text())
-                return '\n'.join(lines)
-            
-            # 3. Tentar textarea (muito antigo)
-            textarea = soup.find('textarea', {'id': 'read-only-cursor-text-area'})
-            if textarea:
-                return textarea.get_text()
-
-            return None # Provavelmente binário
-            
-        except Exception as e:
-            print(f"   ⚠️ Falha ao ler {url}: {e}")
-            return None
-
-    def crawl_directory(self, dir_url: str):
-        """Navega recursivamente nos diretórios."""
-        if dir_url in self.visited_dirs:
-            return
-        self.visited_dirs.add(dir_url)
-        
-        soup = self._get_page_content(dir_url)
-        if not soup: return
-
-        # Extrai items
-        items = self._extract_items_from_payload(soup)
-        
-        files_to_download = []
-        dirs_to_visit = []
-
-        for item in items:
-            if item['type'] == 'blob':
-                files_to_download.append(item)
-            elif item['type'] == 'tree':
-                dirs_to_visit.append(item)
-
-        # Processa arquivos deste diretório
-        if files_to_download:
-            print(f"   📂 Processando pasta: {dir_url.split('/')[-1]} ({len(files_to_download)} arquivos)")
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                futures = {executor.submit(self._process_file, f): f for f in files_to_download}
-                for f in as_completed(futures):
-                    pass # Wait completion
-
-        # Recurse (serial para não sobrecarregar)
-        for d in dirs_to_visit:
-            self.crawl_directory(d['url'])
-
-    def _process_file(self, item: dict):
-        path = item['path']
-        file_path = Path(self.output_dir) / path
-        file_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        if file_path.exists():
-            return # Skip se já existe (opcional)
-
-        content = self._scrape_file_content(item['url'])
-        
-        if content is not None:
+        for el in elements:
             try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                self.stats['files'] += 1
-                self.stats['size'] += len(content)
-                print(f"      ✅ {item['path']}")
-            except Exception as e:
-                print(f"      ❌ Erro ao salvar {item['path']}: {e}")
-        else:
-            self.stats['skipped'] += 1
-            # print(f"      ⏩ Binário/Ignorado: {item['path']}")
+                href = el.get_attribute("href")
+                if not href: continue
+                
+                # Filtra apenas links relevantes dentro do repo
+                if repo_path_part not in href: continue
+                if f"/{self.branch}/" not in href: continue
+                
+                # Ignora links de navegação '..' e commits
+                if href.endswith("/.."): continue
+                if "/commit/" in href or "/commits/" in href or "/blame/" in href: continue
+                
+                # Identifica tipo
+                if f"/tree/{self.branch}/" in href:
+                    links.append({'type': 'tree', 'url': href, 'path': href.split(f"/tree/{self.branch}/")[-1]})
+                elif f"/blob/{self.branch}/" in href:
+                    links.append({'type': 'blob', 'url': href, 'path': href.split(f"/blob/{self.branch}/")[-1]})
+                    
+            except:
+                continue
+                
+        # Remove duplicatas preservando ordem
+        unique_links = []
+        seen = set()
+        for l in links:
+            if l['url'] not in seen:
+                seen.add(l['url'])
+                unique_links.append(l)
+        
+        return unique_links
+
+    def _scrape_file_content(self):
+        """Copia conteúdo do arquivo aberto."""
+        try:
+            # Tenta pegar botão 'Copy raw contents' se existir? Não, melhor ler o DOM.
+            
+            # 1. Tentar ler linhas da tabela de código
+            lines = self.driver.find_elements(By.CSS_SELECTOR, "td.blob-code-inner")
+            if lines:
+                return "\n".join([line.text for line in lines])
+                
+            # 2. Tentar ler do textarea (legacy)
+            try:
+                textarea = self.driver.find_element(By.ID, "read-only-cursor-text-area")
+                return textarea.text
+            except:
+                pass
+
+            # 3. Tentar pegar JSON embedded (React) e parsear (Mais robusto)
+            # Como o driver já carregou a página, podemos executar JS para extrair o payload
+            try:
+                json_content = self.driver.execute_script("""
+                    const scripts = document.querySelectorAll('script[type="application/json"]');
+                    for (const s of scripts) {
+                        if (s.textContent.includes('rawLines')) {
+                            return s.textContent;
+                        }
+                    }
+                    return null;
+                """)
+                if json_content:
+                    data = json.loads(json_content)
+                    if 'payload' in data and 'blob' in data['payload']:
+                         return '\n'.join(data['payload']['blob']['rawLines'])
+            except:
+                pass
+            
+            # Se falhar tudo, verifica se é imagem ou binário
+            if "View raw" in self.driver.page_source:
+                return None # Binário
+
+            return "" # Arquivo vazio
+            
+        except Exception as e:
+            print(f"      ❌ Erro scraping content: {e}")
+            return None
+
+    def crawl(self, url):
+        """Navegação recursiva (DFS) usando o mesmo browser."""
+        if url in self.visited_urls:
+            return
+        self.visited_urls.add(url)
+        
+        print(f"👉 Visitando: {url}")
+        try:
+            self.driver.get(url)
+            self._wait_for_content()
+            
+            page_type = self._get_page_type(url)
+            
+            if page_type == 'tree': 
+                # É diretório
+                items = self._extract_links_from_dir()
+                
+                # Separa arquivos e pastas
+                files = [i for i in items if i['type'] == 'blob']
+                dirs = [i for i in items if i['type'] == 'tree']
+                
+                print(f"   📂 Diretório: {len(files)} arquivos, {len(dirs)} subpastas")
+                
+                # Processa arquivos primeiro (nesta mesma página se possível, mas no selenium temos que navegar)
+                # O selenium requer navegação. Então para cada arquivo, vamos e voltamos ou abrimos nova tab?
+                # Melhor: Empilha tudo.
+                
+                # Vamos iterar sobre os links encontrados
+                for item in files:
+                    self.crawl(item['url'])
+                    
+                for item in dirs:
+                    self.crawl(item['url'])
+                    
+            elif page_type == 'blob':
+                # É arquivo
+                rel_path = unquote(url.split(f"/blob/{self.branch}/")[-1])
+                file_path = Path(self.output_dir) / rel_path
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                
+                if file_path.exists():
+                     print(f"      ⏩ Já existe: {rel_path}")
+                     return
+
+                content = self._scrape_file_content()
+                
+                if content is not None:
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(content)
+                    self.stats['files'] += 1
+                    print(f"      ✅ Salvo: {rel_path}")
+                else:
+                    self.stats['skipped'] += 1
+                    print(f"      ⚠️  Binário/Ignorado: {rel_path}")
+
+        except Exception as e:
+            print(f"   ❌ Erro em {url}: {e}")
+            self.stats['errors'] += 1
 
     def start(self):
-        print(f"\n🕷️  Iniciando Crawler (API-Free) para: {self.owner}/{self.repo}")
-        print(f"Target: {self.web_base}/{self.owner}/{self.repo}/tree/{self.branch}")
+        self._setup_driver()
         
-        start_root = f"{self.web_base}/{self.owner}/{self.repo}/tree/{self.branch}"
+        start_url = f"{self.web_base}/{self.repo_url.split('github.com/')[-1]}/tree/{self.branch}"
+        print(f"🎯 Alvo: {start_url}\n")
         
-        # Verifica se o link 'main' funciona, senão tenta master
-        if self._get_page_content(start_root) is None:
-             if self.branch == 'main':
-                 self.branch = 'master'
-                 start_root = f"{self.web_base}/{self.owner}/{self.repo}/tree/{self.branch}"
-                 print(f"⚠️  Trocando para branch 'master'")
-        
-        start_time = time.time()
-        self.crawl_directory(start_root)
-        
-        elapsed = time.time() - start_time
-        print(f"\n{'='*50}")
-        print(f"✅ Concluído em {elapsed:.2f}s")
-        print(f"   Arquivos: {self.stats['files']}")
-        print(f"   Ignorados (Bin): {self.stats['skipped']}")
-        print(f"   Local: {os.path.abspath(self.output_dir)}")
-        print(f"{'='*50}\n")
+        try:
+            self.crawl(start_url)
+        except KeyboardInterrupt:
+            print("\n🛑 Interrompido pelo usuário.")
+        finally:
+            print("\n🧹 Fechando navegador...")
+            self.driver.quit()
+            
+            print(f"\n{'='*50}")
+            print(f"✅ Concluído")
+            print(f"   Arquivos: {self.stats['files']}")
+            print(f"   Ignorados: {self.stats['skipped']}")
+            print(f"   Local: {os.path.abspath(self.output_dir)}")
+            print(f"{'='*50}\n")
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Uso: python github_downloader.py <URL> [BRANCH] [DESTINO]")
+        print("Uso: python github_downloader.py <URL>")
         sys.exit(1)
         
     url = sys.argv[1]
-    branch = sys.argv[2] if len(sys.argv) > 2 else "main"
-    dest = sys.argv[3] if len(sys.argv) > 3 else None
+    branch = "main" # Pode ser melhorado para aceitar args
     
-    GitHubDownloader(url, dest, branch).start()
+    GitHubDownloader(url, branch=branch).start()
