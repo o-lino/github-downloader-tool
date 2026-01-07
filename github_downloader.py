@@ -10,6 +10,7 @@ import requests
 import time
 import json
 import re
+import getpass
 from urllib.parse import urlparse, unquote
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -30,6 +31,73 @@ class GitHubDownloader:
         })
         self.stats = {'files': 0, 'dirs': 0, 'errors': 0, 'size': 0, 'skipped': 0}
         self.visited_dirs = set()
+        
+        # Check connection and setup proxy if needed
+        self._check_connection()
+
+    def _check_connection(self):
+        """Verifica conexão inicial e configura proxy autenticado se necessário."""
+        print("🔌 Verificando conexão e proxy...")
+        try:
+            # Tenta conectar ao GitHub (usa proxies do sistema/env vars por padrão)
+            self.session.get("https://github.com", timeout=10)
+            print("   ✅ Conexão inicial OK")
+        except requests.exceptions.ProxyError as e:
+            if "407" in str(e) or "authenticationrequired" in str(e).lower():
+                self._handle_proxy_auth()
+            else:
+                self._handle_proxy_auth(force_prompt=True, error_msg=str(e))
+        except requests.exceptions.SSLError:
+            print("   ⚠️  Erro de SSL detectado. Tentando ignorar verificação SSL (não recomendado)...")
+            self.session.verify = False
+            self.session.get("https://github.com", timeout=10)
+        except Exception as e:
+            if "407" in str(e): # Pega 407 genérico
+                self._handle_proxy_auth()
+            else:
+                print(f"   ⚠️  Aviso: Falha na conexão inicial: {e}")
+                print("       O script tentará continuar, mas pode falhar.")
+
+    def _handle_proxy_auth(self, force_prompt=False, error_msg=""):
+        print(f"\n🚫 FALHA DE AUTENTICAÇÃO NO PROXY (407)")
+        if error_msg:
+             print(f"   Erro original: {error_msg}")
+        print("   Suas variáveis de ambiente definem um proxy, mas ele exige usuário e senha.")
+        print("   O Python 'requests' não pega credenciais do Windows automaticamente.\n")
+        
+        choice = input("👉 Deseja inserir usuário/senha do proxy agora? (S/n): ").strip().lower()
+        if choice in ['n', 'nao', 'não']:
+            return
+
+        proxy_host = input("🌐 Proxy Host (ex: proxy.empresa.com:8080) [Enter para tentar detectar]: ").strip()
+        user = input("👤 Usuário Proxy: ").strip()
+        password = getpass.getpass("🔑 Senha Proxy: ").strip()
+
+        if not proxy_host:
+            # Tenta pegar do environ se o usuário não digitar
+            proxy_host = os.environ.get('HTTPS_PROXY') or os.environ.get('HTTP_PROXY') or ""
+            # Remove http:// e credenciais antigas se houver
+            proxy_host = proxy_host.replace("http://", "").replace("https://", "").split("@")[-1]
+        
+        if not proxy_host:
+             print("❌ Erro: Nenhum host de proxy encontrado ou fornecido.")
+             return
+
+        # Monta URL autenticada
+        proxy_url = f"http://{user}:{password}@{proxy_host}"
+        
+        self.session.proxies = {
+            "http": proxy_url,
+            "https": proxy_url
+        }
+        
+        print("\n🔄 Retentando conexão com credenciais...")
+        try:
+            self.session.get("https://github.com", timeout=10)
+            print("   ✅ Autenticação de Proxy: SUCESSO!")
+        except Exception as e:
+             print(f"   ❌ Falha na autenticação do proxy: {e}")
+             sys.exit(1)
 
     def _parse_repo_url(self) -> tuple:
         parsed = urlparse(self.repo_url)
