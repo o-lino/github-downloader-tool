@@ -8,14 +8,14 @@ Uma ferramenta Python simples e eficiente para baixar repositórios públicos do
 ## 🚀 Funcionalidades
 
 - **Clone sem Git**: Baixa todo o conteúdo sem precisar do protocolo git.
+- **Modo Scraping Inteligente**: Simula a navegação de um usuário ("abrir e copiar"), contornando bloqueios a downloads diretos ou à API raw.
 - **Estrutura Preservada**: Mantém a hierarquia exata de pastas e arquivos.
-- **Downloads Paralelos**: Usa threads para baixar múltiplos arquivos simultaneamente.
-- **Resiliência**: Tenta automaticamente branches alternativas (main/master) e retenta downloads falhos.
-- **Sem Dependências Pesadas**: Requer apenas Python e a biblioteca `requests`.
+- **Resiliência**: Tenta automaticamente branches alternativas e extrai código do HTML da página.
+- **Sem Dependências Pesadas**: Requer apenas `requests` e `beautifulsoup4`.
 
 ## 📦 Instalação
 
-1. Clone ou baixe este repositório (ou copie o script `github_downloader.py`).
+1. Clone ou baixe este repositório.
 2. Instale as dependências:
 
 ```bash
